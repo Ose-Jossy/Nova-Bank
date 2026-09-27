@@ -1,0 +1,1 @@
+{"name":"novabank-transactions","version":"1.0.0","type":"module","scripts":{"start":"node src/server.js"},"dependencies":{"express":"^5.1.0","mongoose":"^8.18.0","jsonwebtoken":"^9.0.2","pdfkit":"^0.17.2"}}

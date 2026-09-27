@@ -1,0 +1,1 @@
+{"name":"novabank","private":true,"workspaces":["frontend","services/*"],"scripts":{"install:all":"npm install --workspaces","dev":"docker compose up --build","test":"npm run test --workspaces"}}
