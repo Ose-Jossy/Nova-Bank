@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: accounts
+  labels:
+    app: accounts
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: accounts
+  template:
+    metadata:
+      labels:
+        app: accounts
+    spec:
+      imagePullSecrets:
+        - name: regcred
+      containers:
+        - name: accounts
+          image: 423716046426.dkr.ecr.us-east-1.amazonaws.com/novabank-accounts:v1
+          ports:
+            - containerPort: 4002
+          env:
+            - name: PORT
+              value: "4002"
+          envFrom:
+            - secretRef:
+                name: accounts-secrets
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4002
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4002
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
