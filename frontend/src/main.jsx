@@ -134,7 +134,7 @@ function Progress({ step, total }) {
 }
 
 /* ---------- auth ---------- */
-function Auth({ mode, onDone }) {
+function Auth({ mode, onDone, onBack, onSwitch }) {
   const [step, setStep] = useState(1);
   const [f, setF] = useState({});
   const [err, setErr] = useState('');
@@ -171,7 +171,7 @@ function Auth({ mode, onDone }) {
   return (
     <div className="screen">
       <Progress step={step} total={total} />
-      <button className="back" onClick={() => step > 1 ? (setStep(step - 1), setErr('')) : onDone(null)}>←</button>
+      <button className="back" onClick={() => step > 1 ? (setStep(step - 1), setErr('')) : onBack()}>←</button>
 
       {mode === 'register' && step === 1 && <>
         <h1>Let’s start with your email address</h1>
@@ -222,9 +222,11 @@ function Auth({ mode, onDone }) {
 
       {err && <div className="error">{err}</div>}
       <button className="btn primary" onClick={submit}>
-        {step === total ? 'Verify' : step === 3 && mode === 'register' ? 'Continue' : 'Continue'} →
+        {step === total ? 'Verify' : 'Continue'} →
       </button>
-      <p className="fine center">Have an account? <span className="accent" onClick={() => onDone(null, true)}>Login</span></p>
+      {mode === 'register'
+        ? <p className="fine center">Have an account? <span className="accent" onClick={onSwitch}>Login</span></p>
+        : <p className="fine center">New to Nova? <span className="accent" onClick={onSwitch}>Open an account</span></p>}
     </div>
   );
 }
@@ -315,13 +317,6 @@ function Home({ account, user, go }) {
   </>);
 }
 
-function Panel({ title, children, back }) {
-  return (<>
-    <div className="page-head"><button className="back" onClick={back}>←</button><h2>{title}</h2></div>
-    <div className="panel">{children}</div>
-  </>);
-}
-
 function Send({ token, back }) {
   const [email, setEmail] = useState(''), [amount, setAmount] = useState(''), [msg, setMsg] = useState('');
   return (<>
@@ -368,13 +363,17 @@ const Generic = {
   bills: { t: 'Utility bills', rows: [['Electricity', 'NEPA / PHED · AEDC · EKEDC', 'Pay'], ['Water', 'State water corporations', 'Pay'], ['Internet', 'Fiber & LTE providers', 'Pay'], ['Cable TV', 'DStv · GOtv · StarTimes', 'Pay']] }
 };
 
+// Every page id a row can navigate to: the generic pages plus the real, built pages.
+const NAV = new Set([...Object.keys(Generic), 'send', 'airtime', 'history', 'invest', 'settings']);
+
 function GenericPage({ id, go, back }) {
   const g = Generic[id];
+  if (!g) return null;
   return (<>
     <div className="page-head"><button className="back" onClick={back}>←</button><h2>{g.t}</h2></div>
     <div className="panel">
-      {g.rows.map(([a, b, c]) => <div className="row linkrow" key={a} onClick={() => { const q = Generic[c]; if (q) go(c); }}>
-        <div><b>{a}</b><small>{b}</small></div><span className="accent">{c} →</span>
+      {g.rows.map(([a, b, c]) => <div className="row linkrow" key={a} onClick={() => { if (NAV.has(c)) go(c); }}>
+        <div><b>{a}</b><small>{b}</small></div><span className="accent cap">{c} →</span>
       </div>)}
     </div>
   </>);
@@ -407,7 +406,7 @@ function Toggle({ on, set }) {
 function Settings({ back }) {
   const [s, setS] = useState({ two: true, lock: true, face: false });
   const rows = [
-    ['Two-step verification', 'Improves security by requiring an OTP after logging in on an unauthorized device', 'two', true],
+    ['Two-step verification', 'Improves security by requiring an OTP after logging in on an unauthorized device', 'two'],
     ['App lock', 'Require a PIN to unlock your Nova app', 'lock'],
     ['Face ID / Touch ID', 'Require Face ID or Touch ID to unlock your Nova app', 'face']
   ];
@@ -453,9 +452,10 @@ function Profile({ user, account, go, back, logout }) {
 
 /* ---------- app shell ---------- */
 function App() {
-  const [view, setView] = useState('onboarding'); // onboarding | register | login | kyc | app
-  const [page, setPage] = useState('home');
   const [token, setToken] = useState(localStorage.token || '');
+  // A returning user with a saved token goes straight to the app, not the onboarding slides.
+  const [view, setView] = useState(localStorage.token ? 'app' : 'onboarding'); // onboarding | register | login | kyc | app
+  const [page, setPage] = useState('home');
   const [account, setAccount] = useState(null);
   const [user, setUser] = useState(null);
 
@@ -466,18 +466,25 @@ function App() {
     }).then(setAccount).catch(() => { localStorage.removeItem('token'); setToken(''); setView('onboarding'); });
   }, [token]);
 
-  const logout = () => { localStorage.removeItem('token'); setToken(''); setAccount(null); setUser(null); setView('onboarding'); };
+  const logout = () => { localStorage.removeItem('token'); setToken(''); setAccount(null); setUser(null); setPage('home'); setView('onboarding'); };
   const go = p => setPage(p);
   const back = () => setPage('home');
 
   if (view === 'onboarding') return <div className="frame"><Onboarding go={m => setView(m)} /></div>;
   if (view === 'register' || view === 'login') return (
-    <div className="frame"><Auth mode={view} onDone={(v, toLogin) => {
-      if (toLogin) return setView('login');
-      if (view === 'register') return setView('kyc');
-      setToken(v);
-      setView('app');
-    }} /></div>
+    <div className="frame">
+      <Auth
+        key={view}
+        mode={view}
+        onBack={() => setView('onboarding')}
+        onSwitch={() => setView(view === 'register' ? 'login' : 'register')}
+        onDone={v => {
+          if (view === 'register') return setView('kyc');
+          localStorage.token = v;
+          setToken(v);
+          setView('app');
+        }} />
+    </div>
   );
   if (view === 'kyc') return <div className="frame"><Kyc onDone={() => setView('login')} /></div>;
   if (!account || !user) return <div className="frame"><div className="loading">Loading Nova…</div></div>;
@@ -502,7 +509,6 @@ function App() {
       </div>
       <div className="page">
         {pages[page] || <GenericPage id={page} go={go} back={back} />}
-        {genericIds.includes(page) && page === 'more' ? null : null}
       </div>
       <nav className="tabbar">
         <button className={page === 'home' ? 'on' : ''} onClick={back}>🏠<span>Home</span></button>

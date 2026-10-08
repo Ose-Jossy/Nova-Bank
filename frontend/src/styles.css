@@ -13,6 +13,7 @@ h2{font-size:20px;font-weight:700;margin:0}
 .fine{color:var(--muted);font-size:12px;margin:14px 0}
 .center{text-align:center}
 .accent{color:var(--green);font-weight:600}
+.cap{text-transform:capitalize}
 .error{background:#3a1414;color:#ffb3ad;padding:12px 14px;border-radius:12px;margin:14px 0;font-size:13px}
 .loading{text-align:center;padding:90px 20px;color:var(--muted)}
 
