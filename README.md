@@ -1,47 +1,84 @@
-# NovaBank — production-oriented learning/demo banking app
+# Nova Banking App
 
-NovaBank is a simulated banking application for learning and demonstrations. **It is not a real bank and must not be used for real money, real KYC, real securities orders, real crypto custody, or real utility settlement.**
+Nova is a full-stack digital banking and investing platform built for the Nigerian market — send money instantly, buy airtime and pay bills, and invest in Nigerian and U.S. stocks, ETFs, bonds and more, all from one account.
+
+![stack](https://img.shields.io/badge/stack-React%20%C2%B7%20Express%20%C2%B7%20MongoDB%20%C2%B7%20Docker%20%C2%B7%20Kubernetes-00c896)
+
+## Features
+
+- **Accounts & Onboarding** — email + phone registration, 6-digit email verification, password policy enforcement, tier-based identity verification (Tier 1 / Tier 2)
+- **Payments** — peer-to-peer transfers by email, instant airtime (MTN, Glo, Airtel, 9mobile), utility bills
+- **Investing** — US & NG portfolios, stocks and ETFs watchlists, fixed income (FGN bonds, T-bills, Eurobonds), primary offers / IPOs, stock gifts
+- **International wallets** — USD, GBP, EUR and more, from a single login
+- **Security** — bcrypt password hashing, JWT sessions, two-step OTP verification on every login, transaction PIN, internal service authentication
+- **Activity** — full transaction history with running balance
+
+## Tech Stack
+
+| Layer      | Technology |
+|------------|------------|
+| Frontend   | React 19 + Vite, mobile-first design |
+| Services   | Node.js + Express (auth, accounts, transactions) |
+| Database   | MongoDB 8 |
+| Proxy      | nginx (public API paths only) |
+| Containers | Docker Compose, Kubernetes (K3s), ECR |
+| CI/CD      | GitHub Actions → auto-deploy to EC2 |
+| Edge       | Caddy (automatic HTTPS via Let's Encrypt) |
 
 ## Architecture
-- React + Vite frontend
-- Express microservices (`auth`, `accounts`, `transactions`)
-- MongoDB
-- Docker Compose (Kubernetes manifests coming next — see `k8s/`)
 
-## Security fix applied in this version
-
-The original build proxied `/accounts/` and `/transactions/` wholesale through nginx, which meant each service's **unauthenticated internal routes** (`/internal/provision`, `/internal/by-user/:id`, `/internal/change`) were reachable directly from the public internet — anyone could credit or debit any account with no login at all.
-
-This version fixes that with two layers of defense:
-1. **nginx now only proxies specific public `/api/v1/...` paths.** Internal routes are never listed, so they're structurally unreachable through the reverse proxy.
-2. **A shared `INTERNAL_SERVICE_SECRET`** is required on every internal route, checked via an `x-internal-secret` header — so even if something else ever exposes them, they still refuse unauthenticated callers.
-3. **`accounts-service` gained a proper public endpoint**, `GET /api/v1/accounts/me`, which verifies the caller's JWT and returns only *their own* account — this is what the frontend calls now, instead of reaching into `/internal/by-user/:id` directly.
-
-## Password policy
-At least 8 characters. Allowed characters are:
-`A-Z a-z 0-9 @ # $ % ^ & * ( ) _ + !`
-
-## Run with Docker
-1. Install Docker Desktop.
-2. Copy `.env.example` to `.env` and set a strong, unique value for both `JWT_SECRET` and `INTERNAL_SERVICE_SECRET`.
-3. Run `docker compose up --build`.
-4. Open `http://localhost:5173`.
-
-SMTP is optional for local learning. Without SMTP, verification codes are printed in the auth container logs. For production email, configure SMTP credentials through your secret manager.
-
-## GitHub + VS Code
-
-This is a normal source repository. Push it to GitHub, clone it anywhere, open it in VS Code, edit any file, and commit/push as usual:
-
-```bash
-git init
-git add .
-git commit -m "Initial NovaBank production learning environment"
-git branch -M main
-git remote add origin https://github.com/YOUR-USER/YOUR-REPO.git
-git push -u origin main
+```
+Browser / Mobile
+      │  HTTPS
+      ▼
+   Caddy ──► nginx (frontend)
+                 │  /api/v1/auth/*         ▼
+                 │  /api/v1/accounts/*   auth-service :4001 ─┐
+                 │  /api/v1/transactions/* accounts :4002   │ x-internal-secret
+                 ▼                        transactions :4003 ┘
+              MongoDB (per-service databases)
 ```
 
-## Before real production
+Internal routes (`/internal/*`) are never exposed through the reverse proxy and require a shared `INTERNAL_SERVICE_SECRET` header — even if a route were exposed, it refuses unauthenticated callers. Each user can only ever read their own account via `GET /api/v1/accounts/me`, verified against their JWT.
 
-This project remains a learning/demo system. A genuine financial product would require regulated banking/payment partners, double-entry ledgering, idempotency, reconciliation, audit trails, fraud/AML controls, secrets management, rate limiting, observability, backups, high availability, security testing, and applicable regulatory/compliance work. Do not connect real customer funds to this code without a substantial security and architecture review.
+## Getting Started
+
+### Prerequisites
+- Docker with the Compose plugin
+
+### Run locally
+
+```bash
+cp .env.example .env   # set JWT_SECRET and INTERNAL_SERVICE_SECRET
+docker compose up --build
+```
+
+Open `http://localhost:5173`.
+
+Every new account is provisioned automatically with a ₦5,000 starting balance. Email verification codes are delivered via SMTP when configured; otherwise they're printed in the auth container logs.
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `JWT_SECRET` | Signing key for session tokens |
+| `INTERNAL_SERVICE_SECRET` | Shared secret for service-to-service calls |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` | Transactional email (verification codes) |
+| `MAIL_FROM` | Sender identity for outbound email |
+
+## Deployment
+
+- **Docker Compose** — `docker compose up --build -d`
+- **CI/CD** — pushing to `main` triggers `.github/workflows/deploy.yml`, which SSHes into the EC2 host, pulls, rebuilds and restarts the stack
+- **Kubernetes** — manifests in `k8s/` (StatefulSet MongoDB, service deployments) for K3s clusters
+
+## Security
+
+- Passwords: bcrypt (cost 12), min 8 chars, charset `A-Z a-z 0-9 @#$%^&*()_+!`
+- Short-lived JWT sessions (2h) with OTP challenge on every login
+- Whitelist-only reverse proxy: internal endpoints structurally unreachable from the internet
+- Secrets live in environment variables / your secret manager — never in source control
+
+## License
+
+Proprietary — © Nova Financial Technologies. All rights reserved.
