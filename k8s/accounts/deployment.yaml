@@ -18,7 +18,7 @@ spec:
         - name: regcred
       containers:
         - name: accounts
-          image: 423716046426.dkr.ecr.us-east-1.amazonaws.com/novabank-accounts:v1
+          image: 423716046426.dkr.ecr.eu-west-2.amazonaws.com/novabank-accounts:v2
           ports:
             - containerPort: 4002
           env:
