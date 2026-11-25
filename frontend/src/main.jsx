@@ -477,6 +477,10 @@ function App() {
       return api('/api/v1/accounts/me', null, token);
     }).then(setAccount).catch(() => { setToken(''); setView('onboarding'); });
   }, [token]);
+  // Refresh the balance on returning Home (after a transfer/airtime); a page refresh would log out.
+  useEffect(() => {
+    if (token && page === 'home') api('/api/v1/accounts/me', null, token).then(setAccount).catch(() => { });
+  }, [page]);
 
   const logout = () => { setToken(''); setAccount(null); setUser(null); setPage('home'); setView('onboarding'); };
   const go = p => setPage(p);
