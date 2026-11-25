@@ -91,6 +91,30 @@ Every new account is provisioned automatically with a ₦5,000 starting balance.
 - Session: the JWT is kept in memory only (no localStorage), so refreshing the page means logging in again. An XSS bug could still act during an open session; the upgrade path is an httpOnly SameSite=Strict cookie
 - Transfers and airtime require an `Idempotency-Key` header and apply exactly once. If the accounts service crashes between debiting the sender and crediting the recipient, the money is in flight until a retry with the same key or the background sweep completes it (within about 2 minutes)
 
+## What changed in v2, and why it's better
+
+v2 is the `fix/core-security-and-accounts` branch. It fixes the core features that broke on the previous `main` (v1) and closes several security holes. It adds no new features.
+
+| Area | v1 (previous `main`) | v2 | Why it matters |
+|---|---|---|---|
+| Accounts service | `accounts-service/src/server.js` had been overwritten with a copy of the auth service in commit 2fd24d7, so `/accounts/me` and the `/internal/*` routes were missing | Restored from 2738bc6 and hardened | Login, the ₦5,000 starting balance, transfers and airtime all work again; in v1 they all failed |
+| OTP check | `req.body.code` went straight into the database query, so `{"code":{"$ne":null}}` passed verification | Code must be a 6-digit string; it is stored as an HMAC hash; 5 attempts per code; rate limit per email | Closes a 2FA and email-verification bypass |
+| OTP delivery | Without SMTP, the code came back in the API response (`demoCode`) and showed in the UI; codes came from `Math.random()` | Code goes only to email or the server log; codes come from `crypto.randomInt` | Anyone reading the response could log in as someone else |
+| Money format | JS floats, no upper limit | Integer kobo; amounts parsed from naira strings without float maths; ₦1,000,000 cap | No rounding errors (for example 0.1 + 0.2); no absurd amounts |
+| Overspending | Balance check and debit were separate steps, so parallel requests could overspend | One atomic conditional debit | Tested: 10 parallel ₦1,000 transfers from ₦5,000 give exactly 5 successes and a final balance of ₦0 |
+| Transfer safety | Debit and credit were two HTTP calls whose responses were never checked, so a failed credit lost the money | One `/internal/transfer` call; a crash part-way is finished exactly once by a retry or a background sweep | Money can't disappear between accounts |
+| Repeated requests | A double click or a network retry could send the money twice | `Idempotency-Key` required; a replay returns the original result | Each payment applies exactly once |
+| Ledger | Only the sender got a history row | Both sides get a row | The recipient can see incoming transfers |
+| Recipient checks | Self-transfer allowed; an unknown email returned "Recipient not found" | Self-transfer rejected; generic error for unknown recipients | No sending money to yourself; nobody can probe which emails have accounts |
+| Secrets | Fell back to `change-this-in-production` / `dev-only-secret` | Services refuse to start on missing, weak (under 32 characters) or identical secrets | Stops a deploy from silently running with guessable keys |
+| Database | Published on host port 27017 with no auth | Not published; login required | The database is no longer open to the network |
+| Session token | Stored in `localStorage` | Kept in memory only | An XSS bug can no longer read and steal it |
+| Tests and CI | No tests; `npm test` failed; every push deployed | 17 unit tests; deploy waits for `npm test` | A broken commit no longer goes live automatically |
+
+**Verified:** all 17 unit tests pass. A smoke test against a real MongoDB 8 (with auth) passed every check: OTP injection blocked, attempt cap enforced, balances exact, replays rejected, concurrent overspend prevented, airtime correct, and the database refusing unauthenticated access.
+
+**Not yet changed:** one secret is still shared by all services, the Kubernetes MongoDB still has no auth, there are no lockfiles, and the AWS account ID is still in `k8s/`.
+
 ## License
 
 Proprietary — © Nova Financial Technologies. All rights reserved.
