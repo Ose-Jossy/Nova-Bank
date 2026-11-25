@@ -10,7 +10,7 @@ Nova is a full-stack digital banking and investing platform built for the Nigeri
 - **Payments** — peer-to-peer transfers by email, instant airtime (MTN, Glo, Airtel, 9mobile), utility bills
 - **Investing** — US & NG portfolios, stocks and ETFs watchlists, fixed income (FGN bonds, T-bills, Eurobonds), primary offers / IPOs, stock gifts
 - **International wallets** — USD, GBP, EUR and more, from a single login
-- **Security** — bcrypt password hashing, JWT sessions, two-step OTP verification on every login, transaction PIN, internal service authentication
+- **Security** — bcrypt password hashing, JWT sessions, two-step OTP verification on every login, internal service authentication
 - **Activity** — full transaction history with running balance
 
 ## Tech Stack
@@ -49,20 +49,29 @@ Internal routes (`/internal/*`) are never exposed through the reverse proxy and 
 ### Run locally
 
 ```bash
-cp .env.example .env   # set JWT_SECRET and INTERNAL_SERVICE_SECRET
+cp .env.example .env
+# Fill the three secrets with distinct generated values (hex keeps them URL-safe):
+sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env
+sed -i "s/^INTERNAL_SERVICE_SECRET=.*/INTERNAL_SERVICE_SECRET=$(openssl rand -hex 32)/" .env
+sed -i "s/^MONGO_ROOT_PASSWORD=.*/MONGO_ROOT_PASSWORD=$(openssl rand -hex 32)/" .env
 docker compose up --build
 ```
 
 Open `http://localhost:5173`.
 
-Every new account is provisioned automatically with a ₦5,000 starting balance. Email verification codes are delivered via SMTP when configured; otherwise they're printed in the auth container logs.
+The services refuse to start if `JWT_SECRET` or `INTERNAL_SERVICE_SECRET` is missing, shorter than 32 characters, a known default, or if the two are equal. Compose refuses to start if any secret is unset.
+
+Every new account is provisioned automatically with a ₦5,000 starting balance. Email verification and login codes are delivered via SMTP when configured; otherwise they're printed in the auth container logs: `docker compose logs auth`.
+
+**Upgrading an existing install:** reset the volume with `docker compose down -v`. MongoDB only creates the root user on an empty volume, and balances are now stored in integer kobo, so old data is not compatible.
 
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
 | `JWT_SECRET` | Signing key for session tokens |
-| `INTERNAL_SERVICE_SECRET` | Shared secret for service-to-service calls |
+| `INTERNAL_SERVICE_SECRET` | Shared secret for service-to-service calls (must differ from `JWT_SECRET`) |
+| `MONGO_ROOT_USER` / `MONGO_ROOT_PASSWORD` | MongoDB root credentials (Mongo is not published on the host) |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` | Transactional email (verification codes) |
 | `MAIL_FROM` | Sender identity for outbound email |
 
@@ -78,6 +87,9 @@ Every new account is provisioned automatically with a ₦5,000 starting balance.
 - Short-lived JWT sessions (2h) with OTP challenge on every login
 - Whitelist-only reverse proxy: internal endpoints structurally unreachable from the internet
 - Secrets live in environment variables / your secret manager — never in source control
+- OTP codes come from a CSPRNG, are stored only as HMAC hashes, expire (15 min verify, 10 min login) and allow 5 attempts per code; auth routes are rate-limited per email
+- Session: the JWT is kept in memory only (no localStorage), so refreshing the page means logging in again. An XSS bug could still act during an open session; the upgrade path is an httpOnly SameSite=Strict cookie
+- Transfers and airtime require an `Idempotency-Key` header and apply exactly once. If the accounts service crashes between debiting the sender and crediting the recipient, the money is in flight until a retry with the same key or the background sweep completes it (within about 2 minutes)
 
 ## License
 

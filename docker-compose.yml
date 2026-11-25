@@ -3,15 +3,18 @@ services:
     image: mongo:8
     restart: unless-stopped
     volumes: [mongo_data:/data/db]
-    ports: ["27017:27017"]
+    # Not published on the host; only reachable from the compose network, with auth.
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?set MONGO_ROOT_USER in .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
 
   auth:
     build: ./services/auth-service
     environment:
       PORT: 4001
-      MONGO_URL: mongodb://mongo:27017/novabank_auth
-      JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
-      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-change-this-in-production}
+      MONGO_URL: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/novabank_auth?authSource=admin
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:?set INTERNAL_SERVICE_SECRET in .env}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
@@ -24,18 +27,18 @@ services:
     build: ./services/accounts-service
     environment:
       PORT: 4002
-      MONGO_URL: mongodb://mongo:27017/novabank_accounts
-      JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
-      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-change-this-in-production}
+      MONGO_URL: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/novabank_accounts?authSource=admin
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:?set INTERNAL_SERVICE_SECRET in .env}
     depends_on: [mongo]
 
   transactions:
     build: ./services/transactions-service
     environment:
       PORT: 4003
-      MONGO_URL: mongodb://mongo:27017/novabank_transactions
-      JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
-      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-change-this-in-production}
+      MONGO_URL: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/novabank_transactions?authSource=admin
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:?set INTERNAL_SERVICE_SECRET in .env}
       AUTH_URL: http://auth:4001
       ACCOUNTS_URL: http://accounts:4002
     depends_on: [mongo, auth, accounts]
