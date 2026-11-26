@@ -3,17 +3,25 @@ import { createRoot } from 'react-dom/client';
 import './styles.css';
 
 /* ---------- helpers ---------- */
-const api = async (path, body, token) => {
+const api = async (path, body, token, headers = {}) => {
   const r = await fetch(path, {
     method: body ? 'POST' : 'GET',
-    headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
     ...(body ? { body: JSON.stringify(body) } : {})
   });
   const d = await r.json().catch(() => ({ error: 'The server returned an invalid response.' }));
-  if (!r.ok) throw Error(d.error || 'Request failed.');
+  if (!r.ok) throw Object.assign(Error(d.error || 'Request failed.'), { status: r.status });
   return d;
 };
-const fmt = n => '₦' + Number(n || 0).toLocaleString();
+// Amounts from the API are integer kobo.
+const fmt = k => '₦' + (Number(k || 0) / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// getRandomValues, not randomUUID: randomUUID is undefined on plain-HTTP origins.
+const newKey = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+// Pay with an idempotency key that is kept for retries after a network error/5xx and renewed otherwise.
+const payWith = async (key, setMsg, call, okMsg) => {
+  try { await call({ 'Idempotency-Key': key.current }); key.current = newKey(); setMsg(okMsg); }
+  catch (e) { if (e.status < 500) key.current = newKey(); setMsg(e.message); }
+};
 
 /* ---------- brand ---------- */
 function Logo({ dark }) {
@@ -152,15 +160,15 @@ function Auth({ mode, onDone, onBack, onSwitch }) {
         if (step === 1) return setStep(2);
         if (step === 2) return setStep(3);
         if (step === 3) {
-          const d = await api('/api/v1/auth/register', { fullName: f.fullName, email: f.email, phone: f.phone, password: f.password });
-          setF({ ...f, demoCode: d.demoCode }); return setStep(4);
+          await api('/api/v1/auth/register', { fullName: f.fullName, email: f.email, phone: f.phone, password: f.password });
+          return setStep(4);
         }
         await api('/api/v1/auth/verify', { email: f.email, code: f.code });
         onDone(f.email);
       } else {
         if (step === 1) {
-          const d = await api('/api/v1/auth/login', { email: f.email, password: f.password });
-          setF({ ...f, demoCode: d.demoCode }); return setStep(2);
+          await api('/api/v1/auth/login', { email: f.email, password: f.password });
+          return setStep(2);
         }
         const d = await api('/api/v1/auth/login/verify', { email: f.email, code: f.code });
         onDone(d.token);
@@ -201,7 +209,6 @@ function Auth({ mode, onDone, onBack, onSwitch }) {
         <h1>Verify your email address</h1>
         <p className="sub">Please submit the 6-digit confirmation code sent to <b>{f.email}</b></p>
         <OTP value={f.code} onChange={v => set('code', v)} />
-        {f.demoCode && <p className="fine">Code: <b>{f.demoCode}</b></p>}
         <p className="fine">Resend code 0:57</p>
       </>}
 
@@ -217,7 +224,6 @@ function Auth({ mode, onDone, onBack, onSwitch }) {
         <h1>Verify your email address</h1>
         <p className="sub">Please submit the 6-digit confirmation code sent to <b>{f.email}</b></p>
         <OTP value={f.code} onChange={v => set('code', v)} />
-        {f.demoCode && <p className="fine">Code: <b>{f.demoCode}</b></p>}
       </>}
 
       {err && <div className="error">{err}</div>}
@@ -319,15 +325,18 @@ function Home({ account, user, go }) {
 
 function Send({ token, back }) {
   const [email, setEmail] = useState(''), [amount, setAmount] = useState(''), [msg, setMsg] = useState('');
+  const key = useRef(newKey()), [busy, setBusy] = useState(false);
+  const edit = set => e => { key.current = newKey(); set(e.target.value); };
   return (<>
     <div className="page-head"><button className="back" onClick={back}>←</button><h2>Send money</h2></div>
     <div className="panel">
-      <Field label="Recipient email" type="email" placeholder="Enter recipient email" value={email} onChange={e => setEmail(e.target.value)} />
-      <Field label="Amount (₦)" placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} />
+      <Field label="Recipient email" type="email" placeholder="Enter recipient email" value={email} onChange={edit(setEmail)} />
+      <Field label="Amount (₦)" placeholder="0.00" value={amount} onChange={edit(setAmount)} />
       {msg && <p className="fine">{msg}</p>}
-      <button className="btn primary" onClick={async () => {
-        try { await api('/api/v1/transactions/transfer', { recipientEmail: email, amount }, token); setMsg('Transfer completed successfully.'); }
-        catch (e) { setMsg(e.message); }
+      <button className="btn primary" disabled={busy} onClick={async () => {
+        setBusy(true);
+        await payWith(key, setMsg, h => api('/api/v1/transactions/transfer', { recipientEmail: email, amount }, token, h), 'Transfer completed successfully.');
+        setBusy(false);
       }}>Send</button>
     </div>
   </>);
@@ -335,16 +344,19 @@ function Send({ token, back }) {
 
 function Airtime({ token, back }) {
   const [amount, setAmount] = useState(''), [provider, setProvider] = useState('MTN'), [msg, setMsg] = useState('');
+  const key = useRef(newKey()), [busy, setBusy] = useState(false);
+  const edit = set => e => { key.current = newKey(); set(e.target.value); };
   return (<>
     <div className="page-head"><button className="back" onClick={back}>←</button><h2>Airtime</h2></div>
     <div className="panel">
       <label className="field"><span>Provider</span>
-        <select value={provider} onChange={e => setProvider(e.target.value)}>{['MTN', 'GLO', 'Airtel', '9mobile'].map(p => <option key={p}>{p}</option>)}</select></label>
-      <Field label="Amount (₦)" placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} />
+        <select value={provider} onChange={edit(setProvider)}>{['MTN', 'GLO', 'Airtel', '9mobile'].map(p => <option key={p}>{p}</option>)}</select></label>
+      <Field label="Amount (₦)" placeholder="0.00" value={amount} onChange={edit(setAmount)} />
       {msg && <p className="fine">{msg}</p>}
-      <button className="btn primary" onClick={async () => {
-        try { await api('/api/v1/transactions/airtime', { provider, amount }, token); setMsg('Airtime purchased successfully.'); }
-        catch (e) { setMsg(e.message); }
+      <button className="btn primary" disabled={busy} onClick={async () => {
+        setBusy(true);
+        await payWith(key, setMsg, h => api('/api/v1/transactions/airtime', { provider, amount }, token, h), 'Airtime purchased successfully.');
+        setBusy(false);
       }}>Pay</button>
     </div>
   </>);
@@ -396,7 +408,7 @@ function History({ token, back }) {
   return (<>
     <div className="page-head"><button className="back" onClick={back}>←</button><h2>Transaction history</h2></div>
     <div className="panel">{rows.length === 0 && <p className="fine">No transactions yet.</p>}
-      {rows.map((x, i) => <div className="row" key={i}><span>{x.description}</span><b>{fmt(x.amount)}</b></div>)}</div>
+      {rows.map((x, i) => <div className="row" key={i}><span>{x.description}</span><b>{x.direction === 'credit' ? '+' : '−'}{fmt(x.amount)}</b></div>)}</div>
   </>);
 }
 
@@ -452,9 +464,9 @@ function Profile({ user, account, go, back, logout }) {
 
 /* ---------- app shell ---------- */
 function App() {
-  const [token, setToken] = useState(localStorage.token || '');
-  // A returning user with a saved token goes straight to the app, not the onboarding slides.
-  const [view, setView] = useState(localStorage.token ? 'app' : 'onboarding'); // onboarding | register | login | kyc | app
+  // Session token lives in memory only (never web storage); a refresh means logging in again.
+  const [token, setToken] = useState('');
+  const [view, setView] = useState('onboarding'); // onboarding | register | login | kyc | app
   const [page, setPage] = useState('home');
   const [account, setAccount] = useState(null);
   const [user, setUser] = useState(null);
@@ -463,10 +475,14 @@ function App() {
     if (token) api('/api/v1/auth/me', null, token).then(u => {
       setUser(u);
       return api('/api/v1/accounts/me', null, token);
-    }).then(setAccount).catch(() => { localStorage.removeItem('token'); setToken(''); setView('onboarding'); });
+    }).then(setAccount).catch(() => { setToken(''); setView('onboarding'); });
   }, [token]);
+  // Refresh the balance on returning Home (after a transfer/airtime); a page refresh would log out.
+  useEffect(() => {
+    if (token && page === 'home') api('/api/v1/accounts/me', null, token).then(setAccount).catch(() => { });
+  }, [page]);
 
-  const logout = () => { localStorage.removeItem('token'); setToken(''); setAccount(null); setUser(null); setPage('home'); setView('onboarding'); };
+  const logout = () => { setToken(''); setAccount(null); setUser(null); setPage('home'); setView('onboarding'); };
   const go = p => setPage(p);
   const back = () => setPage('home');
 
@@ -480,7 +496,6 @@ function App() {
         onSwitch={() => setView(view === 'register' ? 'login' : 'register')}
         onDone={v => {
           if (view === 'register') return setView('kyc');
-          localStorage.token = v;
           setToken(v);
           setView('app');
         }} />

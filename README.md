@@ -10,7 +10,7 @@ Nova is a full-stack digital banking and investing platform built for the Nigeri
 - **Payments** — peer-to-peer transfers by email, instant airtime (MTN, Glo, Airtel, 9mobile), utility bills
 - **Investing** — US & NG portfolios, stocks and ETFs watchlists, fixed income (FGN bonds, T-bills, Eurobonds), primary offers / IPOs, stock gifts
 - **International wallets** — USD, GBP, EUR and more, from a single login
-- **Security** — bcrypt password hashing, JWT sessions, two-step OTP verification on every login, transaction PIN, internal service authentication
+- **Security** — bcrypt password hashing, JWT sessions, two-step OTP verification on every login, internal service authentication
 - **Activity** — full transaction history with running balance
 
 ## Tech Stack
@@ -49,20 +49,29 @@ Internal routes (`/internal/*`) are never exposed through the reverse proxy and 
 ### Run locally
 
 ```bash
-cp .env.example .env   # set JWT_SECRET and INTERNAL_SERVICE_SECRET
+cp .env.example .env
+# Fill the three secrets with distinct generated values (hex keeps them URL-safe):
+sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env
+sed -i "s/^INTERNAL_SERVICE_SECRET=.*/INTERNAL_SERVICE_SECRET=$(openssl rand -hex 32)/" .env
+sed -i "s/^MONGO_ROOT_PASSWORD=.*/MONGO_ROOT_PASSWORD=$(openssl rand -hex 32)/" .env
 docker compose up --build
 ```
 
 Open `http://localhost:5173`.
 
-Every new account is provisioned automatically with a ₦5,000 starting balance. Email verification codes are delivered via SMTP when configured; otherwise they're printed in the auth container logs.
+The services refuse to start if `JWT_SECRET` or `INTERNAL_SERVICE_SECRET` is missing, shorter than 32 characters, a known default, or if the two are equal. Compose refuses to start if any secret is unset.
+
+Every new account is provisioned automatically with a ₦5,000 starting balance. Email verification and login codes are delivered via SMTP when configured; otherwise they're printed in the auth container logs: `docker compose logs auth`.
+
+**Upgrading an existing install:** reset the volume with `docker compose down -v`. MongoDB only creates the root user on an empty volume, and balances are now stored in integer kobo, so old data is not compatible.
 
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
 | `JWT_SECRET` | Signing key for session tokens |
-| `INTERNAL_SERVICE_SECRET` | Shared secret for service-to-service calls |
+| `INTERNAL_SERVICE_SECRET` | Shared secret for service-to-service calls (must differ from `JWT_SECRET`) |
+| `MONGO_ROOT_USER` / `MONGO_ROOT_PASSWORD` | MongoDB root credentials (Mongo is not published on the host) |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` | Transactional email (verification codes) |
 | `MAIL_FROM` | Sender identity for outbound email |
 
@@ -78,6 +87,33 @@ Every new account is provisioned automatically with a ₦5,000 starting balance.
 - Short-lived JWT sessions (2h) with OTP challenge on every login
 - Whitelist-only reverse proxy: internal endpoints structurally unreachable from the internet
 - Secrets live in environment variables / your secret manager — never in source control
+- OTP codes come from a CSPRNG, are stored only as HMAC hashes, expire (15 min verify, 10 min login) and allow 5 attempts per code; auth routes are rate-limited per email
+- Session: the JWT is kept in memory only (no localStorage), so refreshing the page means logging in again. An XSS bug could still act during an open session; the upgrade path is an httpOnly SameSite=Strict cookie
+- Transfers and airtime require an `Idempotency-Key` header and apply exactly once. If the accounts service crashes between debiting the sender and crediting the recipient, the money is in flight until a retry with the same key or the background sweep completes it (within about 2 minutes)
+
+## What changed in v2, and why it's better
+
+v2 is the `fix/core-security-and-accounts` branch. It fixes the core features that broke on the previous `main` (v1) and closes several security holes. It adds no new features.
+
+| Area | v1 (previous `main`) | v2 | Why it matters |
+|---|---|---|---|
+| Accounts service | `accounts-service/src/server.js` had been overwritten with a copy of the auth service in commit 2fd24d7, so `/accounts/me` and the `/internal/*` routes were missing | Restored from 2738bc6 and hardened | Login, the ₦5,000 starting balance, transfers and airtime all work again; in v1 they all failed |
+| OTP check | `req.body.code` went straight into the database query, so `{"code":{"$ne":null}}` passed verification | Code must be a 6-digit string; it is stored as an HMAC hash; 5 attempts per code; rate limit per email | Closes a 2FA and email-verification bypass |
+| OTP delivery | Without SMTP, the code came back in the API response (`demoCode`) and showed in the UI; codes came from `Math.random()` | Code goes only to email or the server log; codes come from `crypto.randomInt` | Anyone reading the response could log in as someone else |
+| Money format | JS floats, no upper limit | Integer kobo; amounts parsed from naira strings without float maths; ₦1,000,000 cap | No rounding errors (for example 0.1 + 0.2); no absurd amounts |
+| Overspending | Balance check and debit were separate steps, so parallel requests could overspend | One atomic conditional debit | Tested: 10 parallel ₦1,000 transfers from ₦5,000 give exactly 5 successes and a final balance of ₦0 |
+| Transfer safety | Debit and credit were two HTTP calls whose responses were never checked, so a failed credit lost the money | One `/internal/transfer` call; a crash part-way is finished exactly once by a retry or a background sweep | Money can't disappear between accounts |
+| Repeated requests | A double click or a network retry could send the money twice | `Idempotency-Key` required; a replay returns the original result | Each payment applies exactly once |
+| Ledger | Only the sender got a history row | Both sides get a row | The recipient can see incoming transfers |
+| Recipient checks | Self-transfer allowed; an unknown email returned "Recipient not found" | Self-transfer rejected; generic error for unknown recipients | No sending money to yourself; nobody can probe which emails have accounts |
+| Secrets | Fell back to `change-this-in-production` / `dev-only-secret` | Services refuse to start on missing, weak (under 32 characters) or identical secrets | Stops a deploy from silently running with guessable keys |
+| Database | Published on host port 27017 with no auth | Not published; login required | The database is no longer open to the network |
+| Session token | Stored in `localStorage` | Kept in memory only | An XSS bug can no longer read and steal it |
+| Tests and CI | No tests; `npm test` failed; every push deployed | 17 unit tests; deploy waits for `npm test` | A broken commit no longer goes live automatically |
+
+**Verified:** all 17 unit tests pass. A smoke test against a real MongoDB 8 (with auth) passed every check: OTP injection blocked, attempt cap enforced, balances exact, replays rejected, concurrent overspend prevented, airtime correct, and the database refusing unauthenticated access.
+
+**Not yet changed:** one secret is still shared by all services, the Kubernetes MongoDB still has no auth, there are no lockfiles, and the AWS account ID is still in `k8s/`.
 
 ## License
 

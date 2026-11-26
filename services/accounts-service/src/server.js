@@ -1,181 +1,167 @@
 import express from 'express';
 import mongoose from 'mongoose';
-import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import nodemailer from 'nodemailer';
+import { loadSecrets, safeEqual, generateAccountNumber, isId, isKoboDelta } from './lib.js';
 
 const app = express();
 app.use(express.json());
 
-const port = process.env.PORT || 4001;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-secret';
-
-// Shared secret that ONLY backend services know, required on service-to-service
-// ("internal") routes. This is a lightweight stand-in for a real service-mesh /
-// mTLS setup, and a second layer of defense even if a route is ever accidentally
-// exposed publicly by a reverse proxy.
-const INTERNAL_SECRET = process.env.INTERNAL_SERVICE_SECRET || 'dev-only-internal-secret';
+const port = process.env.PORT || 4002;
+// Throws (and exits) on missing/weak secrets before anything else starts.
+const { JWT_SECRET, INTERNAL_SECRET } = loadSecrets();
 
 await mongoose.connect(process.env.MONGO_URL);
 
-const User = mongoose.model('User', new mongoose.Schema({
-  fullName: String,
-  email: { type: String, unique: true },
-  phone: String,
-  passwordHash: String,
-  isVerified: Boolean,
-  verificationCode: String,
-  verificationExpires: Date,
-  loginCode: String,
-  loginCodeExpires: Date,
+const Account = mongoose.model('Account', new mongoose.Schema({
+  userId: { type: String, unique: true },
+  accountNumber: { type: String, unique: true },
+  balance: { type: Number, default: 500000 }, // integer kobo (₦5,000.00)
+  currency: { type: String, default: 'NGN' },
+  // Op ids already applied to this balance, so each leg applies at most once.
+  // shortcut: grows by one entry per operation per account; move to a replica set with transactions if accounts get busy
+  appliedOps: { type: [String], select: false },
 }, { timestamps: true }));
 
-const mailer = process.env.SMTP_HOST
-  ? nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: false,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    })
-  : null;
+// Transfer intent + status; _id is the caller's transferId (idempotency key).
+const Transfer = mongoose.model('Transfer', new mongoose.Schema({
+  _id: String,
+  fromUserId: String,
+  toUserId: String,
+  amount: Number,
+  status: { type: String, enum: ['pending', 'done', 'failed'] },
+  reason: String,
+}, { timestamps: true }));
 
-const sendCode = async (to, code, subject) => {
-  if (!mailer) {
-    console.log('[NovaBank demo code]', to, code);
-    return false;
+await Promise.all([Account.init(), Transfer.init()]);
+
+// Middleware: verifies a user's JWT for PUBLIC endpoints (called by the frontend).
+function requireUser(req, res, next) {
+  try {
+    req.user = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), JWT_SECRET, { algorithms: ['HS256'] });
+    next();
+  } catch {
+    res.status(401).json({ error: 'Not signed in.' });
   }
-  await mailer.sendMail({ from: process.env.MAIL_FROM, to, subject, text: `Your NovaBank demo code is ${code}.` });
-  return true;
-};
+}
 
-const passwordOk = (p) => typeof p === 'string' && p.length >= 8 && /^[A-Za-z0-9@#$%^&*()_+!]+$/.test(p);
-const code = () => String(Math.floor(100000 + Math.random() * 900000));
-
-// Middleware: only allow requests carrying the correct internal service secret.
-// This route should never be reachable from the public internet, and this
-// middleware is the last line of defense if it ever is.
+// Middleware: verifies the shared secret for INTERNAL endpoints (called only by
+// other backend services, never by the frontend/browser directly).
 function requireInternal(req, res, next) {
-  if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) {
+  if (!safeEqual(req.headers['x-internal-secret'], INTERNAL_SECRET)) {
     return res.status(401).json({ error: 'Not authorized for internal access.' });
   }
   next();
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'auth' }));
+// One atomic single-document update per leg: never overdraws, never applies opId twice.
+async function applyDelta(userId, delta, opId) {
+  const updated = await Account.findOneAndUpdate(
+    { userId, appliedOps: { $ne: opId }, ...(delta < 0 ? { balance: { $gte: -delta } } : {}) },
+    { $inc: { balance: delta }, $push: { appliedOps: opId } });
+  if (updated) return 'applied';
+  const acc = await Account.findOne({ userId }).select('+appliedOps');
+  if (!acc) return 'missing';
+  return acc.appliedOps.includes(opId) ? 'already' : 'insufficient';
+}
 
-app.post('/api/v1/auth/register', async (req, res) => {
-  try {
-    const { fullName, email, phone, password } = req.body || {};
-    if (!fullName || fullName.trim().length < 2) return res.status(422).json({ error: 'Enter your full name.' });
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(422).json({ error: 'Enter a valid email address.' });
-    if (!phone || phone.trim().length < 7) return res.status(422).json({ error: 'Enter a valid phone number.' });
-    if (!passwordOk(password)) return res.status(422).json({ error: 'Password must be at least 8 characters and use only letters, numbers and @#$%^&*()_+!.' });
+const insufficient = (res) => res.status(409).json({ error: 'Insufficient demo balance.', code: 'INSUFFICIENT' });
+const failure = (res, reason) => reason === 'insufficient' ? insufficient(res)
+  : reason === 'no_sender' ? res.status(404).json({ error: 'Account not found.', code: 'NO_SENDER' })
+  : res.status(422).json({ error: 'Recipient account not found.', code: 'NO_RECIPIENT' });
 
-    const e = email.trim().toLowerCase();
-    if (await User.exists({ email: e })) return res.status(409).json({ error: 'An account with that email already exists.' });
+// Runs the remaining legs of a pending transfer. Returns 'done' or a failure reason.
+// Throws (leaving it pending, debit recorded) on unexpected errors; a same-key retry or the sweep finishes it.
+async function runTransfer(t) {
+  const fail = async (reason) => {
+    await Transfer.updateOne({ _id: t._id, status: 'pending' }, { status: 'failed', reason });
+    return reason;
+  };
+  if (!(await Account.exists({ userId: t.toUserId }))) return fail('no_recipient');
+  const debit = await applyDelta(t.fromUserId, -t.amount, t._id);
+  if (debit === 'insufficient') return fail('insufficient');
+  if (debit === 'missing') return fail('no_sender');
+  if (await applyDelta(t.toUserId, t.amount, t._id) === 'missing') throw new Error(`Transfer ${t._id}: recipient account vanished`);
+  await Transfer.updateOne({ _id: t._id }, { status: 'done' });
+  return 'done';
+}
 
-    const verificationCode = code();
-    const user = await User.create({
-      fullName: fullName.trim(),
-      email: e,
-      phone: phone.trim(),
-      passwordHash: await bcrypt.hash(password, 12),
-      isVerified: false,
-      verificationCode,
-      verificationExpires: new Date(Date.now() + 15 * 60000),
-    });
+// Forward recovery for transfers interrupted between legs. Legs are idempotent, so overlap is safe.
+async function sweep() {
+  const stale = await Transfer.find({ status: 'pending', updatedAt: { $lt: new Date(Date.now() - 60_000) } }).limit(50);
+  for (const t of stale) await runTransfer(t).catch(console.error);
+}
+setInterval(() => sweep().catch(console.error), 60_000).unref();
 
-    // Provision an account for this user — a service-to-service call, so it
-    // carries the internal secret header.
-    await fetch(`${process.env.ACCOUNTS_URL}/internal/provision`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-internal-secret': INTERNAL_SECRET },
-      body: JSON.stringify({ userId: user.id }),
-    });
+app.get('/health', (req, res) => res.json({ ok: true, service: 'accounts' }));
 
-    const sent = await sendCode(e, verificationCode, 'Your NovaBank verification code');
-    res.status(201).json({ userId: user.id, emailSent: sent, demoCode: sent ? undefined : verificationCode });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'We could not create your account. Please try again.' });
-  }
+// PUBLIC — the only account route the frontend should ever call directly.
+// Requires a valid JWT; a user can only ever see their own account.
+app.get('/api/v1/accounts/me', requireUser, async (req, res) => {
+  const account = await Account.findOne({ userId: req.user.userId });
+  if (!account) return res.status(404).json({ error: 'Account not found.' });
+  res.json(account);
 });
 
-app.post('/api/v1/auth/verify', async (req, res) => {
-  try {
-    const { email, code: submittedCode } = req.body || {};
-    const u = await User.findOne({
-      email: String(email).toLowerCase(),
-      verificationCode: submittedCode,
-      verificationExpires: { $gt: new Date() },
-    });
-    if (!u) return res.status(400).json({ error: 'That verification code is invalid or expired.' });
-
-    u.isVerified = true;
-    u.verificationCode = undefined;
-    u.verificationExpires = undefined;
-    await u.save();
-    res.json({ ok: true });
-  } catch {
-    res.status(500).json({ error: 'Verification failed. Please try again.' });
-  }
-});
-
-app.post('/api/v1/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    const u = await User.findOne({ email: String(email || '').toLowerCase() });
-    if (!u || !(await bcrypt.compare(password || '', u.passwordHash))) {
-      return res.status(401).json({ error: 'Invalid email or password.' });
+// INTERNAL — called by auth-service right after a user registers. Idempotent.
+app.post('/internal/provision', requireInternal, async (req, res) => {
+  const { userId } = req.body ?? {};
+  if (!isId(userId)) return res.status(422).json({ error: 'Invalid account request.' });
+  for (let i = 0; ; i++) {
+    try {
+      const account = await Account.findOneAndUpdate({ userId },
+        { $setOnInsert: { userId, accountNumber: generateAccountNumber() } }, { upsert: true, new: true });
+      return res.status(201).json(account);
+    } catch (err) {
+      // 11000: accountNumber collision or a concurrent provision for the same user.
+      if (err?.code !== 11000 || i >= 2) throw err;
     }
-    if (!u.isVerified) return res.status(403).json({ error: 'Please verify your demo account first.' });
-
-    const loginCode = code();
-    u.loginCode = loginCode;
-    u.loginCodeExpires = new Date(Date.now() + 10 * 60000);
-    await u.save();
-
-    const sent = await sendCode(u.email, loginCode, 'Your NovaBank login code');
-    res.json({ emailSent: sent, demoCode: sent ? undefined : loginCode });
-  } catch {
-    res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
-app.post('/api/v1/auth/login/verify', async (req, res) => {
-  const { email, code: submittedCode } = req.body || {};
-  const u = await User.findOne({
-    email: String(email).toLowerCase(),
-    loginCode: submittedCode,
-    loginCodeExpires: { $gt: new Date() },
-  });
-  if (!u) return res.status(401).json({ error: 'That login code is invalid or expired.' });
-
-  u.loginCode = undefined;
-  u.loginCodeExpires = undefined;
-  await u.save();
-  res.json({ token: jwt.sign({ userId: u.id, email: u.email }, JWT_SECRET, { expiresIn: '2h' }) });
+// INTERNAL — called by transactions-service to check a sender's balance.
+app.get('/internal/by-user/:userId', requireInternal, async (req, res) => {
+  const account = await Account.findOne({ userId: req.params.userId });
+  if (!account) return res.status(404).json({ error: 'Account not found.' });
+  res.json(account);
 });
 
-app.get('/api/v1/auth/me', async (req, res) => {
+// INTERNAL — single idempotent balance change (airtime, etc). delta is integer kobo.
+app.post('/internal/change', requireInternal, async (req, res) => {
+  const { userId, delta, opId } = req.body ?? {};
+  if (!isId(userId) || !isKoboDelta(delta) || !isId(opId)) return res.status(422).json({ error: 'Invalid change request.' });
+  const result = await applyDelta(userId, delta, opId);
+  if (result === 'missing') return res.status(404).json({ error: 'Account not found.' });
+  if (result === 'insufficient') return insufficient(res);
+  res.json({ account: await Account.findOne({ userId }), applied: result === 'applied' });
+});
+
+// INTERNAL — moves money between two accounts exactly once per transferId.
+app.post('/internal/transfer', requireInternal, async (req, res) => {
+  const { transferId, fromUserId, toUserId, amount } = req.body ?? {};
+  if (!isId(transferId) || !isId(fromUserId) || !isId(toUserId) || !Number.isSafeInteger(amount) || amount <= 0 || fromUserId === toUserId) {
+    return res.status(422).json({ error: 'Invalid transfer request.' });
+  }
+  let t;
   try {
-    const payload = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), JWT_SECRET);
-    const u = await User.findById(payload.userId);
-    if (!u) return res.status(404).json({ error: 'User not found.' });
-    res.json({ userId: u.id, fullName: u.fullName, email: u.email, phone: u.phone });
-  } catch {
-    res.status(401).json({ error: 'Not signed in.' });
+    t = await Transfer.create({ _id: transferId, fromUserId, toUserId, amount, status: 'pending' });
+  } catch (err) {
+    if (err?.code !== 11000) throw err;
+    t = await Transfer.findById(transferId);
+    if (t.fromUserId !== fromUserId || t.toUserId !== toUserId || t.amount !== amount) {
+      return res.status(409).json({ code: 'KEY_REUSED', error: 'This request was already used for a different transfer.' });
+    }
+    if (t.status === 'done') return res.json({ transferId, status: 'done', replayed: true });
+    if (t.status === 'failed') return failure(res, t.reason);
   }
+  const result = await runTransfer(t);
+  if (result !== 'done') return failure(res, result);
+  res.status(201).json({ transferId, status: 'done', replayed: false });
 });
 
-// INTERNAL ONLY — used by transactions-service to resolve a recipient's userId
-// from their email during a transfer. Moved off the public /api/v1/auth/ prefix
-// and behind the internal-secret check so it is never reachable from the
-// internet, even by accident.
-app.get('/internal/user', requireInternal, async (req, res) => {
-  const u = await User.findOne({ email: String(req.query.email || '').toLowerCase() });
-  if (!u) return res.status(404).json({ error: 'Recipient not found.' });
-  res.json({ userId: u.id, email: u.email, fullName: u.fullName });
+app.use((err, req, res, next) => {
+  if (err?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid request.' });
+  console.error(err);
+  res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
-app.listen(port, () => console.log(`auth listening on ${port}`));
+app.listen(port, () => console.log(`accounts listening on ${port}`));
